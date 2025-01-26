@@ -1,0 +1,99 @@
+# -----------------------------------------------------------
+# 1) Получаем DHCP Server, сеть и baseNetwork
+# -----------------------------------------------------------
+:local dhcpServer [/ip dhcp-server find];
+:if ([:len $dhcpServer] = 0) do={
+    :put "No DHCP server found!";
+    :error "DHCP server not configured.";
+}
+
+:local dhcpServerName [/ip dhcp-server get $dhcpServer name];
+:put ("DHCP Server: " . $dhcpServerName);
+
+:local networkConfig [/ip dhcp-server network find];
+:if ([:len $networkConfig] = 0) do={
+    :put "No DHCP network found!";
+    :error "DHCP network not configured.";
+}
+
+:local networkAddress [/ip dhcp-server network get $networkConfig address];
+:if ([:len $networkAddress] = 0) do={
+    :put "No network address configured!";
+    :error "Network address not found.";
+}
+:put ("Network Address: " . $networkAddress);
+
+# Убираем маску /24 и т.п. если есть
+:local slashIndex [:find $networkAddress "/"];
+:if ($slashIndex != -1) do={
+    :set networkAddress [:pick $networkAddress 0 $slashIndex];
+}
+:put ("Subnet: " . $networkAddress);
+
+# Функция "откусить" последний октет (192.168.83.0 -> 192.168.83)
+:global getBaseNetwork do={
+    :local fullAddr $1
+
+    :local firstDotIndex  [:find $fullAddr "."];
+    :local secondDotIndex [:find $fullAddr "." ($firstDotIndex + 1)];
+    :local thirdDotIndex  [:find $fullAddr "." ($secondDotIndex + 1)];
+
+    :local oct1 [:pick $fullAddr 0 $firstDotIndex];
+    :local oct2 [:pick $fullAddr ($firstDotIndex + 1) $secondDotIndex];
+
+    :local oct3 ""
+    :if ($thirdDotIndex != -1) do={
+        :set oct3 [:pick $fullAddr ($secondDotIndex + 1) $thirdDotIndex];
+    } else={
+        :set oct3 [:pick $fullAddr ($secondDotIndex + 1) [:len $fullAddr]];
+    }
+
+    :return ($oct1 . "." . $oct2 . "." . $oct3);
+};
+
+:local baseNetwork [$getBaseNetwork $networkAddress];
+:put ("Base Network (3 octets): " . $baseNetwork);
+
+# -----------------------------------------------------------
+# 2) Цикл по динамическим арендам: удаляем, создаём статический
+# -----------------------------------------------------------
+:foreach lease in=[/ip dhcp-server lease find dynamic=yes] do={
+
+    :local macAddr  [/ip dhcp-server lease get $lease mac-address];
+    :local hostName [/ip dhcp-server lease get $lease host-name];
+
+    # Проверяем, есть ли хотя бы 2 последних символа
+    :if ([:len $hostName] >= 2) do={
+
+        :local lastTwoChars [:pick $hostName ([:len $hostName] - 2) [:len $hostName]];
+
+        # Проверяем, действительно ли это цифры
+        :if ([:typeof [:tonum $lastTwoChars]] = "num") do={
+
+            # Считаем новый последний октет как 100 + эти 2 цифры
+            :local lastOctet (100 + [:tonum $lastTwoChars]);
+
+            # Формируем IP-адрес: "192.168.83.130"
+            :local newIP ($baseNetwork . "." . $lastOctet);
+
+            :put ("---");
+            :put ("Removing dynamic lease: hostName=" . $hostName . ", MAC=" . $macAddr);
+            /ip dhcp-server lease remove $lease;
+
+            # Если уже существует lease с таким IP, тоже удалим (форсированная логика)
+            :local conflictLease [/ip dhcp-server lease find where address=$newIP];
+            :if ([:len $conflictLease] > 0) do={
+                :put ("Removing old lease with same IP: " . $newIP);
+                /ip dhcp-server lease remove $conflictLease;
+            }
+
+            # Создаём новый статический lease
+            /ip dhcp-server lease add \
+                address=$newIP \
+                mac-address=$macAddr \
+                server=($dhcpServerName);
+
+            :put ("New static lease added: " . $newIP . " / " . $macAddr);
+        }
+    }
+}
